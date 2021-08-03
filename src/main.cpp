@@ -3,6 +3,19 @@
 #include <PubSubClient.h>
 #include <dimmable_light.h>
 
+//define Pin para dimmers
+#define syncPin 23
+#define dimmerPin 22
+#define dimmerPin2 21
+//Pin Motor
+#define PinPWM_left 19
+#define PinPWM_rigth 18
+#define channelPinA 5
+//Señalizacion - paro de emergencia
+#define  PinbtnStop 4
+#define  PinRun  2
+#define  PinStop 15
+
 //variables para establecer conexion
 const char* ssid = "PSmart 2019"; //"Depar";
 const char* password = "12345678";//"+-+/adgjl--++";
@@ -20,24 +33,19 @@ volatile int pot_res2=0; //valor para varia la potencia de la resistencia del re
 volatile int prc_vlv=0;  //valor para variar la apertura de la vlv proporcional
 volatile int bit_vlAlv=0; // bit para abrir o cerrar el vlv de alivio
 
-//define los datos para los dimmers
-const int syncPin = 23;
-const int dimmerPin = 22;
-const int dimmerPin2 = 21;
-
+//Variables para los dimmers
 DimmableLight rst_tolva(dimmerPin);
 DimmableLight rst_reactor(dimmerPin2);
 
 //variables motor y ajuste PWM
-const uint8_t PinPWM_left = 19;
-const uint8_t PinPWM_rigth = 18;
 const double  freq = 10000;
 const uint8_t Channel_left = 0;
 const uint8_t Channel_rigth = 5;
 const uint8_t resolution = 8;
+
 //lectura de velocidad del motor
-const uint8_t channelPinA = 5;
-int count=0;
+volatile int count=0;
+portMUX_TYPE mux_enc = portMUX_INITIALIZER_UNLOCKED;
 double rpm=0,aux=0;
 //parametros filttro motor
 float Y_d = 0;  
@@ -56,33 +64,45 @@ float kd=0.04;
 unsigned long current_time, prev_time;
 uint8_t dt_ms = 100;
 
+//vlv proporcional - vlv on-off
+
 //****FUNCIONES *********//
 void on_message(char* topic, byte* payload, unsigned int length);
 void reconnect();
 void setup_wifi();
-void encoder();
+void IRAM_ATTR encoder();
 int PID(int SP, int PV, uint8_t sp_ms);
 
 
 void loop2(void *parameter){
-for (;;){
-  current_time = millis();
-  if(current_time-prev_time > dt_ms){ 
-    aux=(count*1000)/(dt_ms);
-    rpm=((aux*60)/224.4);
+  for (;;){
+    if(digitalRead(PinbtnStop)){
+      digitalWrite(PinRun,HIGH);
+      digitalWrite(PinStop,LOW);
+      current_time = millis();
+      if(current_time-prev_time > dt_ms){ 
+        aux=(count*1000)/(dt_ms);
+        rpm=((aux*60)/224.4);
+        
+        Y_d = (float)rpm;
+        S_d=(alpha_d*Y_d)+((1-alpha_d)*S_d);
+        S_d_int=S_d;//velocidad en rpm filtrada
 
-    Y_d = (float)rpm;
-    S_d=(alpha_d*Y_d)+((1-alpha_d)*S_d);
-    S_d_int=S_d;//velocidad en rpm filtrada
-
-    //ledcWrite(Channel_rigth,Speed_mt); //sin control
-    ledcWrite(Channel_rigth,PID(Speed_mt,S_d_int,dt_ms)); //Con control
-    ledcWrite(Channel_left,0);
-    prev_time = current_time;
-    count = 0;
-  }
-  rst_tolva.setBrightness(pot_res);
-  rst_reactor.setBrightness(pot_res2);
+        //ledcWrite(Channel_rigth,Speed_mt); //sin control
+        ledcWrite(Channel_rigth,PID(Speed_mt,S_d_int,dt_ms)); //Con control
+        ledcWrite(Channel_left,0);
+        prev_time = current_time;
+        portENTER_CRITICAL(&mux_enc);
+        count = 0;
+        portEXIT_CRITICAL(&mux_enc);
+      }
+      rst_tolva.setBrightness(pot_res);
+      rst_reactor.setBrightness(pot_res2);
+    }else {
+      Serial.println("PARO DE EMERGENCIA ACTIVADO");
+      digitalWrite(PinRun,LOW);
+      digitalWrite(PinStop,HIGH);
+    }
   }
   vTaskDelay(10);
 }
@@ -100,6 +120,10 @@ void setup() {
   ledcAttachPin(PinPWM_left,Channel_left);
   ledcSetup(Channel_rigth,freq,resolution);
   ledcAttachPin(PinPWM_rigth,Channel_rigth);
+
+  pinMode(PinbtnStop, INPUT_PULLDOWN);
+  pinMode(PinRun, OUTPUT);
+  pinMode(PinStop,OUTPUT);
 
   pinMode(channelPinA, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(channelPinA),encoder, FALLING);
@@ -119,8 +143,10 @@ void loop() {
   client.loop(); 
 }
 
-void encoder(){
+void IRAM_ATTR encoder(){
+  portENTER_CRITICAL_ISR(&mux_enc);
   count++;
+  portEXIT_CRITICAL_ISR(&mux_enc);
 }
 
 int PID(int SP, int PV, uint8_t sp_ms){
@@ -167,8 +193,7 @@ void reconnect(){
       client.subscribe("planta/reactor/resi_elec");
       client.subscribe("planta/reactor/motor");
       client.subscribe("planta/reactor/val_alv");
-
-    } else {
+    }else{
       Serial.print("failed with state");
       Serial.print(client.state());
       delay(2000);
