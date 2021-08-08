@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <dimmable_light.h>
+
 //define Pin para dimmers
 #define syncPin 23
 #define dimmerPin 22
@@ -14,11 +15,14 @@
 #define  PinbtnStop 17 //VERDE
 #define  PinbtnRun 16 //NARANJA
 #define  PinRun  2
-#define  PinStop 15
+#define  PinStop 26
 //valves 
 #define PinOpen 32 
 #define PinClose 33
 #define PinOnOff 25
+
+#define TIMER_INTERRUPT_DEBUG  3
+#include "ESP32_TimerInterrupt.h"
 
 //variables para establecer conexion
 const char* ssid = "Depar"; //"PSmart 2019"; //"Depar";
@@ -31,10 +35,10 @@ PubSubClient client(espClient);
 TaskHandle_t Task0;
 
 //Variables globales******************************
-volatile int Speed_mt=0; //velocidad del motor 
-volatile int pot_res=0;  //valor para variar la pontencia de la resistencia de la tolva
-volatile int pot_res2=0; //valor para varia la potencia de la resistencia del reactor
-volatile int prc_vlv=0;  //valor para variar la apertura de la vlv proporcional
+volatile int Speed_mt=0;  //velocidad del motor 
+volatile int pot_res=0;   //valor para variar la pontencia de la resistencia de la tolva
+volatile int pot_res2=0;  //valor para varia la potencia de la resistencia del reactor
+volatile int prc_vlv=0;   //valor para variar la apertura de la vlv proporcional
 volatile int bit_vlAlv=0; // bit para abrir o cerrar el vlv de alivio
 
 //Variables para los dimmers***********************
@@ -70,11 +74,15 @@ uint8_t dt_ms = 100;
 //vlv proporcional*************************************
 int valor_vlvAnt = 0;
 int diff = 0; 
-int32_t tm_open = 5000000; //en microsegundos
-int32_t tm_close = 5000000; //en microsegundos
-volatile int interruptCounter;
-hw_timer_t * timer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t tm_open = 3500000; //en microsegundos
+uint32_t tm_close = 3400000; //en microsegundos
+uint32_t tm_ac_close = 0;
+uint32_t tm_ac_open = 0;
+volatile bool band_op = false;
+volatile bool band_cl = false;
+ESP32Timer ITimer0(0);
+
+
 bool inicia = false;
 
 //****FUNCIONES *********//
@@ -82,19 +90,12 @@ void on_message(char* topic, byte* payload, unsigned int length);
 void reconnect();
 void setup_wifi();
 void IRAM_ATTR encoder();
-void IRAM_ATTR onTimer_vlv();
+void IRAM_ATTR onTimer_vlv(void);
 int PID(int SP, int PV, uint8_t sp_ms);
 
 
 void loop2(void *parameter){
   for (;;){
-    if (interruptCounter > 0) {
-      portENTER_CRITICAL(&timerMux);
-      interruptCounter--;
-      portEXIT_CRITICAL(&timerMux);
-      digitalWrite(PinOpen,LOW);
-      digitalWrite(PinClose,LOW);
-    }
     if(digitalRead(PinbtnRun)){
       //Serial.println("\t\t\t\tEstoy en el nucleo 0");
       digitalWrite(PinRun,HIGH);
@@ -102,11 +103,12 @@ void loop2(void *parameter){
       current_time = millis();
       if(current_time-prev_time > dt_ms){ 
         aux=(count*1000)/(dt_ms);
-        rpm=((aux*60)/224.4);
+        rpm=((aux*60)/334);
         
         Y_d = (float)rpm;
         S_d=(alpha_d*Y_d)+((1-alpha_d)*S_d);
         S_d_int=S_d;//velocidad en rpm filtrada
+        Serial.println(S_d_int);
 
         //ledcWrite(Channel_rigth,Speed_mt); //sin control
         ledcWrite(Channel_rigth,Speed_mt); //Con control //PID(Speed_mt,S_d_int,dt_ms)
@@ -127,19 +129,23 @@ void loop2(void *parameter){
       diff = prc_vlv - valor_vlvAnt;
       if(diff>0 and diff<=100){
         //Open valve
-        timerAlarmWrite(timer,tm_open*(diff/100), false);
-        timerAlarmEnable(timer);
-        digitalWrite(PinOpen,HIGH);
+        band_op = true;
+        tm_ac_open = tm_open*(float)diff/100;
+        //Serial.print(diff);Serial.print("; Abreindo ;");Serial.println(tm_ac_open); //float(73/5) no es lo mismo que (float)73/5
+        ITimer0.setInterval(tm_ac_open,onTimer_vlv);
+        digitalWrite(PinOpen,HIGH); //digitalRead(PinClose)^1
       }
       if(diff>=-100 and diff <0){
         //Close valve
-        timerAlarmWrite(timer,tm_close*(-diff/100), false);
-        timerAlarmEnable(timer);
-        digitalWrite(PinClose,HIGH);
+        band_cl = true;
+        tm_ac_close = tm_close*(float)diff/-100;
+        //Serial.print(diff);Serial.print("; Cerrando ;");Serial.println(tm_ac_close);
+        ITimer0.setInterval(tm_ac_close,onTimer_vlv);
+        digitalWrite(PinClose,HIGH);//digitalRead(PinOpen)^1
       }
       valor_vlvAnt  = prc_vlv;
     }if(digitalRead(PinbtnStop)){
-      Serial.println("PARO DE EMERGENCIA ACTIVADO");
+      //Serial.println("PARO DE EMERGENCIA ACTIVADO");
       digitalWrite(PinRun,LOW);
       digitalWrite(PinStop,HIGH);
       digitalWrite(PinOnOff,LOW);
@@ -174,9 +180,12 @@ void setup() {
   pinMode(PinOnOff,OUTPUT);
   pinMode(PinClose,OUTPUT);
   pinMode(PinOpen,OUTPUT);
-  
-  timer = timerBegin(3, 80, true);
-  timerAttachInterrupt(timer, &onTimer_vlv, true);
+
+  digitalWrite(PinRun,LOW);
+  digitalWrite(PinStop,LOW);
+  digitalWrite(PinOnOff,LOW);
+  digitalWrite(PinOpen,LOW);
+  digitalWrite(PinClose,LOW);
 
   pinMode(channelPinA, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(channelPinA),encoder, FALLING);
@@ -218,11 +227,17 @@ void IRAM_ATTR encoder(){
   portEXIT_CRITICAL_ISR(&mux_enc);
 }
 
-void IRAM_ATTR onTimer_vlv() {
-  portENTER_CRITICAL_ISR(&timerMux);
-  interruptCounter++;
-  portEXIT_CRITICAL_ISR(&timerMux);
- 
+void IRAM_ATTR onTimer_vlv(void) {  
+ if (band_op){
+    band_op = false;
+    digitalWrite(PinOpen,LOW);
+    //Serial.println("Termino ese porcentaje de Apertura");
+    }
+  if(band_cl){
+    band_cl= false;
+    digitalWrite(PinClose,LOW);
+    //Serial.println("Termino ese  porcentaje Cerrar");
+    }
 }
 
 int PID(int SP, int PV, uint8_t sp_ms){
@@ -281,43 +296,43 @@ void on_message(char* topic, byte* payload, unsigned int leng){
   //Serial.println("In core -> "+ String(xPortGetCoreID()));
   String incoming = "";
   if (String(topic) == "planta/tolva/val_Pro"){
-      Serial.print(topic);
+      //Serial.print(topic);
       for(int i=0; i< leng; i++){
         incoming += (char)payload[i];
       }
       incoming.trim();
       prc_vlv = atoi(incoming.c_str());
-      Serial.println("Mensaje ->" + incoming);
+      //Serial.println("Mensaje ->" + incoming);
     }
   
   if(String(topic) == "planta/tolva/res_elec"){
-      Serial.print(topic);
+      //Serial.print(topic);
       for(int i=0; i< leng; i++){
         incoming += (char)payload[i];
       }
       incoming.trim();
       pot_res = atoi(incoming.c_str());
-      Serial.println(" Mensaje ->" + incoming);
+      //Serial.println(" Mensaje ->" + incoming);
     }
 
   if (String(topic) == "planta/reactor/resi_elec"){
-      Serial.print(topic);
+      //Serial.print(topic);
       for(int i=0; i< leng; i++){
         incoming += (char)payload[i];
       }
       incoming.trim();
       pot_res2 = atoi(incoming.c_str());
-      Serial.println("Mensaje ->" + incoming);
+      //Serial.println("Mensaje ->" + incoming);
    }
   
   if(String(topic) == "planta/reactor/motor"){
-      Serial.print(topic);
+      //Serial.print(topic);
       for(int i=0; i< leng; i++){
           incoming += (char)payload[i];
       }
       incoming.trim();
       Speed_mt = atoi(incoming.c_str());
-      Serial.println(" Mensaje ->" + incoming);
+      //Serial.println(" Mensaje ->" + incoming);
    }
    
   if(String(topic) == "planta/reactor/val_alv"){
