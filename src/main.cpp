@@ -23,7 +23,7 @@
 //variables para establecer conexion
 const char* ssid = "ESPE";//"Carlos";//"Depar"; //PSmart 2019";
 const char* password = "";//"+-+/adgjl--++";//"12345678";//
-const char* mqttServer = "10.2.128.73";//"192.168.43.167";//"192.168.137.19";//"192.168.43.76"; //192.168.0.100
+const char* mqttServer = "10.2.129.73";//"192.168.43.167";//"192.168.137.19";//"192.168.43.76"; //192.168.0.100
 const int mqttPort = 1883;
 
 WiFiClient espClient;
